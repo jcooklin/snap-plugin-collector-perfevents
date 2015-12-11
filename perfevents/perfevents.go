@@ -30,8 +30,11 @@ import (
 	"strings"
 	"time"
 
+	log "github.com/Sirupsen/logrus"
+
 	"github.com/intelsdi-x/pulse/control/plugin"
 	"github.com/intelsdi-x/pulse/control/plugin/cpolicy"
+	"github.com/intelsdi-x/pulse/core/ctypes"
 )
 
 const (
@@ -46,12 +49,14 @@ const (
 	ns_class   = "linux"
 	ns_type    = "perfevents"
 	ns_subtype = "cgroup"
+
+	defaultLogLevel = log.WarnLevel
 )
 
 type event struct {
 	id    string
 	etype string
-	value uint64
+	value float64
 }
 
 type Perfevents struct {
@@ -73,89 +78,140 @@ func (p *Perfevents) CollectMetrics(mts []plugin.PluginMetricType) ([]plugin.Plu
 	if len(mts) == 0 {
 		return nil, nil
 	}
+	logger := getLogger(mts[0].Config().Table())
 	events := []string{}
 	cgroups := []string{}
 
-	// Get list of events and cgroups from Namespace
-	// Replace "_" with "/" in cgroup name
-	for _, m := range mts {
-		err := validateNamespace(m.Namespace())
-		if err != nil {
-			return nil, err
+	allCgroups, err := list_cgroups()
+	if err != nil {
+		return nil, err
+	}
+
+	// Building events and cgroups arguments for perf stat.
+	// Each cgroup is applied to the corresponding event, i.e., first cgroup to
+	// first event, second cgroup to second event and so on.
+	for _, cgroup := range allCgroups {
+		for _, m := range mts {
+			err := validateNamespace(m.Namespace())
+			if err != nil {
+				return nil, err
+			}
+			events = append(events, m.Namespace()[5])
+			cgroups = append(cgroups, cgroup)
 		}
-		events = append(events, m.Namespace()[4])
-		cgroups = append(cgroups, strings.Replace(m.Namespace()[5], "_", "/", -1))
 	}
 
 	// Prepare events (-e) and Cgroups (-G) switches for "perf stat"
 	cgroups_switch := "-G" + strings.Join(cgroups, ",")
 	events_switch := "-e" + strings.Join(events, ",")
 
+	// TODO enable the sleep to be configured
 	// Prepare "perf stat" command
-	cmd := exec.Command("perf", "stat", "--log-fd", "1", `-x;`, "-a", events_switch, cgroups_switch, "--", "sleep", "1")
+	// logger.Debug("RUNNING: ", "perf", "stat", "--log-fd", "1", `-x;`, "-a", events_switch, cgroups_switch, "--", "sleep", "4")
+	fmt.Println("RUNNING: ", "perf", "stat", "--log-fd", "1", `-x;`, "-a", events_switch, cgroups_switch, "--", "sleep", "4")
+	cmd := exec.Command("perf", "stat", "--log-fd", "1", `-x;`, "-a", events_switch, cgroups_switch, "--", "sleep", "4")
 
 	cmdReader, err := cmd.StdoutPipe()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "Error creating StdoutPipe", err)
+		logger.WithField("err", err).Error("Error creating StdoutPipe")
 		return nil, err
 	}
 
 	// Parse "perf stat" output
-	p.cgroup_events = make([]event, len(mts))
+	// p.cgroup_events = make([]event, len(allCgroups)*len(mts))
+	p.cgroup_events = []event{}
 	scanner := bufio.NewScanner(cmdReader)
+	done := make(chan struct{})
+	timer := time.After(5 * time.Second)
 	go func() {
 		for i := 0; scanner.Scan(); i++ {
 			line := strings.Split(scanner.Text(), ";")
-			value, err := strconv.ParseUint(line[0], 10, 64)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "Invalid metric value", err)
+			if len(line) < 3 {
+				logger.WithFields(log.Fields{
+					"line":        line,
+					"line-number": i,
+				}).Errorf("unexpected output - skipping result")
+				continue
 			}
-			etype := line[2]
-			id := line[3]
+			value, err := strconv.ParseFloat(line[0], 64)
+			if err != nil {
+				logger.WithField("err", err).Error("invalid metric value")
+				value = 0
+			}
+			etype := line[1]
+			id := line[2]
 			e := event{id: id, etype: etype, value: value}
-			p.cgroup_events[i] = e
+			logger.WithFields(log.Fields{
+				"line-number": i,
+				"line":        line,
+			}).Debugf("event processed")
+			// p.cgroup_events[i] = e
+			p.cgroup_events = append(p.cgroup_events, e)
 		}
+		close(done)
 	}()
 
 	// Run command and wait (up to 2 secs) for completion
 	err = cmd.Start()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "Error starting perf stat", err)
+		logger.WithField("err", err).Error("starting perf stat")
 		return nil, err
 	}
-
-	st := time.Now()
-	for {
-		if len(p.cgroup_events) == cap(p.cgroup_events) {
-			break
-		}
-		if time.Since(st) > time.Second*2 {
-			return nil, fmt.Errorf("Timed out waiting for metrics from perf stat")
-		}
+	select {
+	case <-timer:
+		return nil, fmt.Errorf("Timed out waiting for metrics from perf stat")
+	case <-done:
+		break
 	}
 	err = cmd.Wait()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "Error waiting for perf stat", err)
+		logger.WithFields(log.Fields{
+			"err": err,
+		}).Error("Error waiting for perf stat")
 		return nil, err
 	}
 
 	// Populate metrics
-	metrics := make([]plugin.PluginMetricType, len(mts))
-	i := 0
-	for _, m := range mts {
-		metric, err := populate_metric(m.Namespace(), p.cgroup_events[i])
+	metrics := []plugin.PluginMetricType{}
+	for idx := range p.cgroup_events {
+		hostname, err := os.Hostname()
 		if err != nil {
-			return nil, err
+			panic(err)
 		}
-		metrics[i] = *metric
-		metrics[i].Source_, _ = os.Hostname()
-		i++
+		if p.cgroup_events[idx].id == "" {
+			continue
+		}
+		metric := plugin.PluginMetricType{
+			Namespace_: []string{
+				ns_vendor,
+				ns_class,
+				ns_type,
+				ns_subtype,
+				p.cgroup_events[idx].id,
+				p.cgroup_events[idx].etype,
+			},
+			Data_:      p.cgroup_events[idx].value,
+			Timestamp_: time.Now(),
+			Source_:    hostname,
+			Labels_: []plugin.Label{
+				plugin.Label{Index: 4, Name: "cgroup"}, //todo define the label in getMetricTypes
+			},
+		}
+		metrics = append(metrics, metric)
+	}
+	// logger.WithFields(log.Fields{
+	// 	"containers-len": len(allCgroups),
+	// 	"events-len":     len(events),
+	// 	"metrics-len":    len(metrics),
+	// }).Debugf("metrics: %+v\n", metrics)
+	for idx := range metrics {
+		logger.Debugf("metric[%d] %+v\n", idx, metrics[idx])
 	}
 	return metrics, nil
 }
 
 // GetMetricTypes returns the metric types exposed by perf events subsystem
-func (p *Perfevents) GetMetricTypes(_ plugin.PluginConfigType) ([]plugin.PluginMetricType, error) {
+func (p *Perfevents) GetMetricTypes(cfg plugin.PluginConfigType) ([]plugin.PluginMetricType, error) {
 	err := p.Init()
 	if err != nil {
 		return nil, err
@@ -184,6 +240,25 @@ func NewPerfeventsCollector() *Perfevents {
 	return &Perfevents{Init: initialize}
 }
 
+func getLogger(cfg map[string]ctypes.ConfigValue) *log.Entry {
+	logLevel := defaultLogLevel
+	if d, ok := cfg["debug"]; ok {
+		switch v := d.(type) {
+		case ctypes.ConfigValueBool:
+			if v.Value {
+				logLevel = log.DebugLevel
+			}
+		default:
+			log.WithFields(log.Fields{
+				"field": "debug",
+				"hint":  "provide a bool",
+			}).Error("unsupported type")
+		}
+	}
+	log.SetLevel(logLevel)
+	return log.WithField("module", "perfevents")
+}
+
 func initialize() error {
 	file, err := os.Open("/proc/sys/kernel/perf_event_paranoid")
 	if err != nil {
@@ -210,12 +285,17 @@ func initialize() error {
 }
 
 func set_supported_metrics(source string, cgroups []string, events []string) []plugin.PluginMetricType {
-	mts := make([]plugin.PluginMetricType, len(events)*len(cgroups))
+	mts := []plugin.PluginMetricType{}
 	for _, e := range events {
-		for _, c := range flatten_cg_name(cgroups) {
-			mts = append(mts, plugin.PluginMetricType{Namespace_: []string{ns_vendor, ns_class, ns_type, source, e, c}})
+		// for _, c := range flatten_cg_name(cgroups) {
+		// 	mts = append(mts, plugin.PluginMetricType{Namespace_: []string{ns_vendor, ns_class, ns_type, source, e, c}})
+		// }
+		mt := plugin.PluginMetricType{
+			Namespace_: []string{ns_vendor, ns_class, ns_type, source, "*", e},
 		}
+		mts = append(mts, mt)
 	}
+	log.Debugf("supported metric types: %+v\n", mts)
 	return mts
 }
 func flatten_cg_name(cg []string) []string {
@@ -226,21 +306,13 @@ func flatten_cg_name(cg []string) []string {
 	return flat_cg
 }
 
-func populate_metric(ns []string, e event) (*plugin.PluginMetricType, error) {
-	return &plugin.PluginMetricType{
-		Namespace_: ns,
-		Data_:      e.value,
-		Timestamp_: time.Now(),
-	}, nil
-}
-
 func list_cgroups() ([]string, error) {
 	cgroups := []string{}
 	base_path := "/sys/fs/cgroup/perf_event/"
 	err := filepath.Walk(base_path, func(path string, info os.FileInfo, _ error) error {
 		if info.IsDir() {
 			cgroup_name := strings.TrimPrefix(path, base_path)
-			if len(cgroup_name) > 0 {
+			if len(cgroup_name) > 0 && !strings.EqualFold(cgroup_name, "docker") {
 				cgroups = append(cgroups, cgroup_name)
 			}
 		}
@@ -253,6 +325,7 @@ func list_cgroups() ([]string, error) {
 	return cgroups, nil
 }
 
+// TODO compliment this method... nice! we should do this on all plugins making debugging an invalid task easier.
 func validateNamespace(namespace []string) error {
 	if len(namespace) != 6 {
 		return errors.New(fmt.Sprintf("unknown metricType %s (should containt exactly 6 segments)", namespace))
@@ -270,8 +343,8 @@ func validateNamespace(namespace []string) error {
 	if namespace[3] != ns_subtype {
 		return errors.New(fmt.Sprintf("unknown metricType %s (expected 4th segment %s)", namespace, ns_subtype))
 	}
-	if !namespaceContains(namespace[4], CGROUP_EVENTS) {
-		return errors.New(fmt.Sprintf("unknown metricType %s (expected 5th segment %v)", namespace, CGROUP_EVENTS))
+	if !namespaceContains(namespace[5], CGROUP_EVENTS) {
+		return errors.New(fmt.Sprintf("unknown metricType %s (expected 6th segment %v)", namespace, CGROUP_EVENTS))
 	}
 	return nil
 }

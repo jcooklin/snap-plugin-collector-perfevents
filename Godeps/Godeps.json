@@ -3,8 +3,7 @@
 	"GoVersion": "go1.4.2",
 	"Deps": [
 		{
-			"ImportPath": "github.com/intelsdi-x/pulse",
-			"Rev": "2da7665ac7e00a8e83998cbbe34d1d69e2fc4a2c"
+			"ImportPath": "github.com/intelsdi-x/pulse"			
 		}
 	]
 }
